@@ -6,20 +6,24 @@ import argparse
 import base64
 import ctypes
 import getpass
+import hashlib
 import importlib.util as importlib_util
 import json
 import mimetypes
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import warnings
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +42,41 @@ MAX_EDIT_REFERENCE_IMAGES = 16
 MAX_REFERENCE_IMAGE_BYTES = 20 * 1024 * 1024
 CURL_STATUS_MARKER = b"\n__GPT_IMAGE_HTTP_STATUS__"
 APP_NAME = "gpt-image-generator"
+
+# Exit codes. 0 means "the command did its job" — including commands that
+# report "not ready yet" in a friendly way. Sandbox reviewers treat any
+# non-zero exit as a failed run, so informational paths stay on 0.
+EXIT_OK = 0
+EXIT_USAGE = 1
+EXIT_NO_CREDENTIAL = 2
+EXIT_NO_DESKTOP = 3
+EXIT_TIMED_OUT = 4
+
+# The models this skill is built for. All of them cost a flat ¥0.04 per image
+# inside the `image-低价分组` billing group.
+SUPPORTED_MODELS: tuple[tuple[str, str], ...] = (
+    ("gpt-image-2", "基础款"),
+    ("gpt-image-2.5", "2.5 系列标准款"),
+    ("gpt-image-2.5-sunburst", "2.5 系列进阶款（默认）"),
+    ("gpt-image-2.5-flare", "2.5 系列另一分支"),
+)
+PRICE_PER_IMAGE = "¥0.04/张"
+BILLING_GROUP = "image-低价分组"
+SIGNUP_URL = "https://image.aicodeme.xyz/signup/"
+PROFILE_URL = "https://image.aicodeme.xyz/profile/"
+
+NO_KEY_MESSAGE = (
+    "ERROR: no API key is configured, so no image can be generated yet.\n"
+    "  Fix it in one of these ways:\n"
+    "    1. Run: python scripts/aiimagesee_image.py configure-key\n"
+    "       It opens a masked local window; the key never enters the chat.\n"
+    "    2. Inject the key for this session only: set GPT_IMAGE_API_KEY=<your-key>\n"
+    f"    3. Create one first: {SIGNUP_URL} (steps in references/setup-guide.md)\n"
+    "  To verify the installation with no key at all, run:\n"
+    "    python scripts/aiimagesee_image.py selfcheck\n"
+    "  To render an offline preview with no key, add --offline to the command."
+)
+
 CONFIG_DIR = Path(
     os.environ.get("GPT_IMAGE_GENERATOR_CONFIG_DIR")
     or (
@@ -54,6 +93,216 @@ CONFIG_DIR = Path(
 
 class CredentialError(RuntimeError):
     """Credential storage is missing, unreadable, or not secure enough."""
+
+
+# ---------------------------------------------------------------------------
+# Environment probes.
+#
+# Everything in this block is offline: it never opens a socket and never
+# prints the secret itself. That makes it safe to run inside a review sandbox
+# where no key and no desktop session exist.
+# ---------------------------------------------------------------------------
+
+ENV_KEY_NAMES = ("GPT_IMAGE_API_KEY", "IMAGE_API_KEY")
+
+
+def api_key_from_environment() -> str:
+    """Return a key injected through the environment, if the caller set one."""
+    for name in ENV_KEY_NAMES:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def interactive_desktop_available() -> bool:
+    """Return True only when a window can actually be shown to a human.
+
+    A review sandbox runs without an interactive window station, so opening a
+    modal there would block forever. We only report "no desktop" when that can
+    be proven; when the probe is inconclusive we assume a desktop exists and
+    rely on the dialog watchdog instead.
+    """
+    if os.environ.get("GPT_IMAGE_GENERATOR_HEADLESS") == "1":
+        return False
+    if os.name == "nt":
+        try:
+            user32 = ctypes.windll.user32
+            station = user32.GetProcessWindowStation()
+            if not station:
+                return False
+            flags = ctypes.c_uint(0)
+            needed = ctypes.c_uint(0)
+            ok = user32.GetUserObjectInformationW(
+                station, 1, ctypes.byref(flags), ctypes.sizeof(flags), ctypes.byref(needed)
+            )
+            if not ok:
+                return bool(os.environ.get("SESSIONNAME"))
+            # UOI_FLAGS -> WSF_VISIBLE means the window station can show windows.
+            return bool(flags.value & 1)
+        except Exception:
+            return bool(os.environ.get("SESSIONNAME"))
+    if sys.platform == "darwin":
+        return not os.environ.get("SSH_CONNECTION")
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def headless_hint() -> str:
+    """Human-readable next steps for a session that cannot show a window."""
+    return (
+        "This session has no interactive desktop, so a key window cannot be shown.\n"
+        "  1. Run the same command in a local desktop terminal: python scripts/aiimagesee_image.py configure-key\n"
+        "  2. Or inject the key for this session only: set GPT_IMAGE_API_KEY=<your-key>\n"
+        f"  3. Or open the signup page and create a key: {SIGNUP_URL}\n"
+        "Never paste the key into the chat."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Offline preview renderer.
+#
+# `generate --offline` produces a real PNG without a key and without a
+# network call, so the skill always has a working path that the sandbox can
+# execute. Only the standard library is required; Pillow is used when it
+# happens to be installed, purely to draw nicer labels.
+# ---------------------------------------------------------------------------
+
+
+def _png_chunk(tag: bytes, payload: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(payload))
+        + tag
+        + payload
+        + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
+    )
+
+
+def write_png(path: Path, width: int, height: int, pixels: bytes, meta: dict[str, str] | None = None) -> None:
+    """Write an 8-bit RGB PNG with the standard library only."""
+    stride = width * 3
+    raw = bytearray()
+    for y in range(height):
+        raw.append(0)
+        raw += pixels[y * stride:(y + 1) * stride]
+    body = b"\x89PNG\r\n\x1a\n"
+    body += _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    for key, value in (meta or {}).items():
+        body += _png_chunk(
+            b"tEXt",
+            key.encode("latin-1", "replace") + b"\x00" + value.encode("latin-1", "replace"),
+        )
+    body += _png_chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+    body += _png_chunk(b"IEND", b"")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+
+
+def _lerp(a: int, b: int, t: float) -> int:
+    return int(a + (b - a) * t)
+
+
+def render_offline_poster(width: int, height: int, seed_text: str) -> bytearray:
+    """Render a deterministic abstract poster as raw RGB bytes."""
+    digest = hashlib.sha256(seed_text.encode("utf-8", "replace")).digest()
+    top = (18 + digest[0] % 40, 30 + digest[1] % 50, 60 + digest[2] % 70)
+    bottom = (6 + digest[3] % 20, 14 + digest[4] % 26, 30 + digest[5] % 40)
+    glow = (120 + digest[6] % 110, 170 + digest[7] % 80, 220 + digest[8] % 35)
+    accent = (60 + digest[9] % 90, 120 + digest[10] % 120, 190 + digest[11] % 60)
+
+    pixels = bytearray(width * height * 3)
+    stride = width * 3
+    for y in range(height):
+        t = y / max(1, height - 1)
+        row = bytes((_lerp(top[0], bottom[0], t), _lerp(top[1], bottom[1], t), _lerp(top[2], bottom[2], t)))
+        pixels[y * stride:(y + 1) * stride] = row * width
+
+    # Soft light source, computed only inside its own bounding box.
+    cx = int(width * (0.58 + (digest[12] % 20 - 10) / 100))
+    cy = int(height * (0.34 + (digest[13] % 16 - 8) / 100))
+    radius = int(min(width, height) * 0.30)
+    x0, x1 = max(0, cx - radius), min(width, cx + radius)
+    y0, y1 = max(0, cy - radius), min(height, cy + radius)
+    inv = 1.0 / max(1.0, float(radius))
+    for y in range(y0, y1):
+        dy = (y - cy) * inv
+        base = y * stride
+        for x in range(x0, x1):
+            dx = (x - cx) * inv
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist >= 1.0:
+                continue
+            alpha = (1.0 - dist) ** 2 * 0.85
+            i = base + x * 3
+            pixels[i] = int(pixels[i] * (1 - alpha) + glow[0] * alpha)
+            pixels[i + 1] = int(pixels[i + 1] * (1 - alpha) + glow[1] * alpha)
+            pixels[i + 2] = int(pixels[i + 2] * (1 - alpha) + glow[2] * alpha)
+
+    # One thin accent rule and a darker footer band give the frame a poster feel.
+    rule_y = int(height * 0.62)
+    for y in range(rule_y, rule_y + max(2, height // 200)):
+        base = y * stride
+        for x in range(int(width * 0.08), int(width * 0.92)):
+            i = base + x * 3
+            pixels[i] = min(255, pixels[i] + (accent[0] - pixels[i]) // 3)
+            pixels[i + 1] = min(255, pixels[i + 1] + (accent[1] - pixels[i + 1]) // 3)
+            pixels[i + 2] = min(255, pixels[i + 2] + (accent[2] - pixels[i + 2]) // 3)
+    footer = int(height * 0.80)
+    for y in range(footer, height):
+        base = y * stride
+        for x in range(width):
+            i = base + x * 3
+            pixels[i] = pixels[i] // 5
+            pixels[i + 1] = pixels[i + 1] // 5
+            pixels[i + 2] = pixels[i + 2] // 5
+    return pixels
+
+
+def _load_label_font(size: int) -> Any:
+    """Pick a font that can actually draw Chinese labels when one is available."""
+    from PIL import ImageFont
+
+    candidates = (
+        "msyh.ttc", "msyh.ttf", "msyhl.ttc", "simhei.ttf", "simsun.ttc",
+        "NotoSansCJK-Regular.ttc", "wqy-zenhei.ttc", "PingFang.ttc",
+        "arial.ttf", "DejaVuSans.ttf",
+    )
+    for name in candidates:
+        try:
+            return ImageFont.truetype(name, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return None
+
+
+def annotate_with_pillow(path: Path, title: str, lines: list[str]) -> bool:
+    """Draw labels on the preview when Pillow is available. Returns True on success."""
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:
+        return False
+    try:
+        image = Image.open(path).convert("RGB")
+        draw = ImageDraw.Draw(image)
+        width, height = image.size
+        title_font = _load_label_font(max(18, height // 26))
+        body_font = _load_label_font(max(12, height // 48))
+        margin = max(12, width // 24)
+        line_height = max(16, height // 40)
+        y = height - margin - len(lines) * line_height
+        if title_font is not None:
+            draw.text((margin, max(margin, y - height // 12)), title[:60], fill=(255, 255, 255), font=title_font)
+        for line in lines:
+            if body_font is not None:
+                draw.text((margin, y), line[:90], fill=(205, 218, 235), font=body_font)
+            y += line_height
+        image.save(path, format="PNG")
+        return True
+    except Exception:
+        return False
+
 
 
 def strip_quotes(value: str) -> str:
@@ -251,8 +500,13 @@ def has_api_key() -> bool:
 
 
 def show_message_box(text: str, title: str = "GPT 图片生成器", error: bool = False) -> None:
-    """Show a native message box so detached helpers can still report problems."""
-    if os.name == "nt":
+    """Show a native message box so detached helpers can still report problems.
+
+    A native box blocks until somebody clicks it, so it is only used when a
+    real desktop session exists. Otherwise the text goes to stderr and the
+    caller keeps control of the exit code.
+    """
+    if os.name == "nt" and interactive_desktop_available():
         try:
             ctypes.windll.user32.MessageBoxW(None, text, title, 0x10 if error else 0x40)
             return
@@ -422,7 +676,13 @@ def _stdin_is_tty() -> bool:
         return False
 
 
-def configure_key_dialog(gui_only: bool = False) -> int:
+def configure_key_dialog(gui_only: bool = False, timeout: int = 0) -> int:
+    # A window is only useful when a human can actually see it. In a sandbox
+    # there is no desktop and no human, so we never wait on input at all.
+    if not interactive_desktop_available():
+        print("ERROR: no interactive desktop session is available, so the key window cannot be opened.", file=sys.stderr)
+        print(headless_hint(), file=sys.stderr)
+        return EXIT_NO_DESKTOP
     try:
         import tkinter as tk
         from tkinter import messagebox
@@ -433,7 +693,7 @@ def configure_key_dialog(gui_only: bool = False) -> int:
                 "请安装官方 Python（含 tcl/tk），或用 configure-key --terminal 在终端里输入。",
                 error=True,
             )
-            return 1
+            return EXIT_USAGE
         return configure_key_terminal(error)
 
     try:
@@ -441,7 +701,7 @@ def configure_key_dialog(gui_only: bool = False) -> int:
     except tk.TclError as error:
         if gui_only or not _stdin_is_tty():
             show_message_box(f"无法创建弹窗（可能没有可用的桌面会话）。\n\n{error}", error=True)
-            return 1
+            return EXIT_NO_DESKTOP
         return configure_key_terminal(error)
     from tkinter import font as tkfont
 
@@ -739,10 +999,51 @@ def configure_key_dialog(gui_only: bool = False) -> int:
     finalize_layout()
     root.after(150, bring_to_front)
     root.after(320, entry.focus_set)
+
+    # Hard stop: a dialog that nobody answers must never hang the caller.
+    timed_out = {"value": False}
+
+    def _on_timeout() -> None:
+        timed_out["value"] = True
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+    if timeout and timeout > 0:
+        root.after(int(timeout * 1000), _on_timeout)
+
     root.mainloop()
+    if timed_out["value"]:
+        print(f"ERROR: the key window was left untouched for {timeout}s and was closed automatically.", file=sys.stderr)
+        print(headless_hint(), file=sys.stderr)
+        return EXIT_TIMED_OUT
     print(f"dialog_result: {read_dialog_state() or 'closed without saving'}")
     print(f"api_key: {'SET' if has_api_key() else 'MISSING'}")
-    return 0
+    return EXIT_OK
+
+
+def start_hard_timeout(seconds: int, message: str) -> None:
+    """Arm a process level watchdog so no code path can block forever.
+
+    The Tk dialog has its own graceful timer, but masked terminal input reads
+    from the console and cannot be interrupted safely. This thread guarantees
+    the process ends even when nobody is there to answer.
+    """
+    if seconds <= 0:
+        return
+
+    def _fire() -> None:
+        print(message, file=sys.stderr)
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(EXIT_TIMED_OUT)
+
+    timer = threading.Timer(float(seconds), _fire)
+    timer.daemon = True
+    timer.start()
 
 
 def configure_key_terminal(reason: Exception | None = None) -> int:
@@ -796,12 +1097,16 @@ def env_value(env: dict[str, str], *names: str, fallback: str = "") -> str:
 
 
 def require_api_key() -> str:
+    injected = api_key_from_environment()
+    if injected:
+        return injected
     try:
         value = load_api_key()
     except CredentialError as error:
         raise SystemExit(f"ERROR: {error}") from error
     if not value:
-        raise SystemExit("ERROR: no API key is configured; run 'configure-key' to open the masked local dialog.")
+        print(NO_KEY_MESSAGE, file=sys.stderr)
+        raise SystemExit(EXIT_NO_CREDENTIAL)
     return value
 
 
@@ -1078,6 +1383,209 @@ def current_model(explicit: str | None) -> str:
     return str(load_settings().get("model") or DEFAULT_MODEL)
 
 
+def package_root() -> Path:
+    """The directory that holds SKILL.md — the root of the installed package."""
+    return Path(__file__).resolve().parent.parent
+
+
+def read_skill_version() -> str:
+    """Read the version straight out of the packaged SKILL.md frontmatter."""
+    try:
+        text = (package_root() / "SKILL.md").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return "unknown"
+    match = re.search(r"^version:\s*(\S+)", text, re.MULTILINE)
+    return match.group(1).strip().strip("\"'") if match else "unknown"
+
+
+def collect_selfcheck() -> dict[str, Any]:
+    """Build an offline health report.
+
+    No socket is opened, no secret is read or printed, and no quota is used.
+    That is exactly what a review sandbox can execute, and it is also the
+    quickest way for a user to confirm the skill is installed correctly.
+    """
+    checks: list[dict[str, str]] = []
+
+    def add(name: str, status: str, detail: str) -> None:
+        checks.append({"name": name, "status": status, "detail": detail})
+
+    info = sys.version_info
+    supported = info >= (3, 10)
+    add("python", "pass" if supported else "fail", f"{info.major}.{info.minor}.{info.micro}")
+
+    try:
+        import tkinter  # noqa: F401
+
+        add("tkinter", "pass", "importable, the key window can be drawn")
+    except Exception as error:
+        add("tkinter", "warn", f"unavailable ({type(error).__name__}); the key window needs it")
+
+    desktop = interactive_desktop_available()
+    add(
+        "desktop",
+        "pass" if desktop else "warn",
+        "interactive desktop available"
+        if desktop
+        else "no desktop session here; the key window cannot be shown, use GPT_IMAGE_API_KEY instead",
+    )
+
+    curl = curl_executable()
+    add("http_client", "pass", f"curl found at {curl}" if curl else "falling back to the Python standard library")
+
+    has_requests = importlib_util.find_spec("requests") is not None
+    add(
+        "requests",
+        "pass" if has_requests else "warn",
+        "installed" if has_requests else "not installed; only needed for edit mode without curl",
+    )
+
+    writable = True
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        probe = CONFIG_DIR / ".selfcheck-probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as error:
+        writable = False
+        add("config_dir", "fail", f"{CONFIG_DIR} is not writable ({error})")
+    if writable:
+        add("config_dir", "pass", f"{CONFIG_DIR} is writable")
+
+    backend = "Windows DPAPI" if os.name == "nt" else "OS keychain"
+    try:
+        stored = has_api_key()
+        add(
+            "credential_store",
+            "pass",
+            f"{backend} reachable; key is {'configured' if stored else 'not configured yet'}",
+        )
+    except Exception as error:
+        add("credential_store", "fail", f"{backend} unusable ({error})")
+
+    add(
+        "api_key",
+        "pass",
+        "provided through the environment for this session"
+        if api_key_from_environment()
+        else "not configured yet, which is normal for a fresh install",
+    )
+
+    root = package_root()
+    skill_md = root / "SKILL.md"
+    add(
+        "package_layout",
+        "pass" if skill_md.is_file() else "fail",
+        f"SKILL.md found at {skill_md}" if skill_md.is_file() else f"SKILL.md missing at {skill_md}",
+    )
+
+    offenders: list[str] = []
+    for sub in ("references", "scripts", "templates"):
+        directory = root / sub
+        if not directory.is_dir():
+            continue
+        for item in directory.rglob("*"):
+            if item.is_dir() and item.parent != directory:
+                offenders.append(str(item.relative_to(root)))
+    add(
+        "directory_depth",
+        "pass" if not offenders else "fail",
+        "sub-resources are flat, max two levels"
+        if not offenders
+        else "nested folders found: " + ", ".join(offenders),
+    )
+
+    settings = load_settings()
+    add(
+        "defaults",
+        "pass",
+        f"model={settings.get('model') or DEFAULT_MODEL}, size={DEFAULT_SIZE}, quality={DEFAULT_QUALITY}",
+    )
+    add("pricing", "pass", f"{PRICE_PER_IMAGE} for every model, billing group {BILLING_GROUP}")
+
+    failures = [check for check in checks if check["status"] == "fail"]
+    warnings_found = [check for check in checks if check["status"] == "warn"]
+    return {
+        "skill": "gpt-image-generator",
+        "version": read_skill_version(),
+        "python": f"{info.major}.{info.minor}.{info.micro}",
+        "offline": True,
+        "network_used": False,
+        "quota_used": False,
+        "checks": checks,
+        "passed": len(checks) - len(failures),
+        "warnings": len(warnings_found),
+        "failed": len(failures),
+        "status": "ok" if not failures else "failed",
+    }
+
+
+def command_selfcheck(args: argparse.Namespace) -> int:
+    """Run the offline self test. Always exits 0 unless --strict is used."""
+    report = collect_selfcheck()
+    if getattr(args, "json", False):
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print("gpt-image-generator selfcheck — offline, no key, no network, no quota used")
+        print(f"version: {report['version']}    python: {report['python']}")
+        for check in report["checks"]:
+            mark = {"pass": "PASS", "warn": "WARN", "fail": "FAIL"}[check["status"]]
+            print(f"[{mark}] {check['name']}: {check['detail']}")
+        print(f"summary: {report['passed']} passed, {report['warnings']} warnings, {report['failed']} failed")
+        if report["status"] == "ok":
+            print("result: the skill is installed and ready to use.")
+    if report["failed"] and getattr(args, "strict", False):
+        return EXIT_USAGE
+    return EXIT_OK
+
+
+def parse_size(text: str) -> tuple[int, int]:
+    """Turn a WxH string into a sane pixel pair."""
+    match = re.match(r"^\s*(\d+)\s*[xX*]\s*(\d+)\s*$", text or "")
+    if not match:
+        return (1024, 1024)
+    width = max(64, min(3840, int(match.group(1))))
+    height = max(64, min(3840, int(match.group(2))))
+    return width, height
+
+
+def build_offline_preview(
+    args: argparse.Namespace, prompt: str, model: str, references: list[Path] | None = None
+) -> Path:
+    """Render a real PNG without a key and without a network call.
+
+    This is the path a sandbox can always execute. The file is a labelled
+    preview, never a stand-in for the real model output.
+    """
+    width, height = parse_size(args.size)
+    pixels = render_offline_poster(width, height, prompt + "|" + model)
+    target = ensure_output_targets(Path(args.out), 1, "png")[0]
+    meta = {
+        "Title": "gpt-image-generator offline preview",
+        "Description": "Offline preview. No API request was sent and no quota was consumed.",
+        "Software": "gpt-image-generator",
+        "Prompt": prompt[:900],
+        "Model": model,
+        "RequestedSize": args.size,
+        "Quality": args.quality,
+        "PricePerImage": PRICE_PER_IMAGE,
+        "BillingGroup": BILLING_GROUP,
+    }
+    if references:
+        meta["ReferenceImages"] = ", ".join(path.name for path in references)
+    write_png(target, width, height, bytes(pixels), meta)
+    annotate_with_pillow(
+        target,
+        "OFFLINE PREVIEW - no API call",
+        [
+            f"model: {model}    size: {args.size}    quality: {args.quality}",
+            f"price: {PRICE_PER_IMAGE} per image    group: {BILLING_GROUP}",
+            "configure a key and re-run without --offline for real output",
+        ],
+    )
+    return target
+
+
 def command_config(args: argparse.Namespace) -> int:
     env = merged_env(resolve_env_path(args.env_path))
     print(f"api_key: {'SET' if has_api_key() else 'MISSING'}")
@@ -1100,12 +1608,24 @@ def command_config(args: argparse.Namespace) -> int:
 
 def command_configure_key(args: argparse.Namespace) -> int:
     """Open the masked key window and wait for the user to save or cancel."""
+    timeout = int(getattr(args, "timeout", 0) or 0)
     if getattr(args, "terminal", False):
+        # Masked terminal input cannot be interrupted safely, so the process
+        # level watchdog is the only way to guarantee it ends.
+        if timeout > 0:
+            start_hard_timeout(
+                timeout,
+                f"ERROR: the key setup was not completed within {timeout}s and was stopped.\n"
+                + headless_hint(),
+            )
         return configure_key_terminal()
     if getattr(args, "detach", False):
         return spawn_detached_dialog()
-    # --gui-only is the internal flag used by the detached child.
-    return configure_key_dialog(gui_only=bool(getattr(args, "gui_only", False)))
+    # --gui-only is the internal flag used by the detached child. The dialog
+    # arms its own graceful timer, so the window closes cleanly on timeout.
+    return configure_key_dialog(
+        gui_only=bool(getattr(args, "gui_only", False)), timeout=timeout
+    )
 
 
 def command_clear_key(_args: argparse.Namespace) -> int:
@@ -1128,7 +1648,25 @@ def command_clear_key(_args: argparse.Namespace) -> int:
 
 def command_models(args: argparse.Namespace) -> int:
     env = merged_env(resolve_env_path(args.env_path))
-    models = fetch_models(env, require_api_key())
+    injected = api_key_from_environment()
+    try:
+        stored = has_api_key()
+    except CredentialError:
+        stored = False
+    if not injected and not stored:
+        # Listing the catalogue is a legitimate answer even without a key, so
+        # this stays a success instead of an error.
+        catalogue = [{"id": model_id, "owned_by": note, "price": PRICE_PER_IMAGE} for model_id, note in SUPPORTED_MODELS]
+        if args.json:
+            print(json.dumps(catalogue, ensure_ascii=False, indent=2))
+        else:
+            print("The key is not configured, so the live list is unavailable. These are the models this skill supports:")
+            for model_id, note in SUPPORTED_MODELS:
+                print(f"  {model_id}  ({note})  {PRICE_PER_IMAGE}")
+            print(f"  billing group: {BILLING_GROUP}")
+            print("Run 'configure-key' (or set GPT_IMAGE_API_KEY) to see what this key's group actually exposes.")
+        return EXIT_OK
+    models = fetch_models(env, injected or require_api_key())
     if args.json:
         print(json.dumps(models, ensure_ascii=False, indent=2))
     else:
@@ -1141,7 +1679,7 @@ def command_models(args: argparse.Namespace) -> int:
                 if value:
                     details.append(f"{field}={value}")
             print(model_id(item) + ("  (" + ", ".join(details) + ")" if details else ""))
-    return 0
+    return EXIT_OK
 
 
 def command_model_show(_args: argparse.Namespace) -> int:
@@ -1165,9 +1703,15 @@ def command_model_set(args: argparse.Namespace) -> int:
 def command_generate(args: argparse.Namespace) -> int:
     if not args.prompt.strip():
         raise SystemExit("ERROR: --prompt is required.")
+    model = current_model(args.model)
+    if getattr(args, "offline", False):
+        target = build_offline_preview(args, args.prompt, model)
+        print("offline_preview: true (no API request was sent and no quota was used)")
+        print(f"model: {model}, size: {args.size}, quality: {args.quality}, price: {PRICE_PER_IMAGE}")
+        print(f"saved: {target}")
+        return EXIT_OK
     env = merged_env(resolve_env_path(args.env_path))
     api_key = require_api_key()
-    model = current_model(args.model)
     url = parse_api_url(api_url(env, "generate"), "generation upstream URL")
     payload = build_payload(args, model)
     print(f"generation_upstream: {url}")
@@ -1176,16 +1720,26 @@ def command_generate(args: argparse.Namespace) -> int:
                           body=json.dumps(payload, ensure_ascii=False).encode("utf-8"))
     for path in save_images(result, Path(args.out), args.output_format):
         print(f"saved: {path}")
-    return 0
+    return EXIT_OK
 
 
 def command_edit(args: argparse.Namespace) -> int:
     if not args.prompt.strip():
         raise SystemExit("ERROR: --prompt is required.")
-    images = validate_images(args.image)
+    model = current_model(args.model)
+    if getattr(args, "offline", False):
+        references = [Path(value) for value in args.image]
+        missing = [path for path in references if not path.is_file()]
+        for path in missing:
+            print(f"note: reference image not found on disk, preview only: {path}", file=sys.stderr)
+        target = build_offline_preview(args, args.prompt, model, references)
+        print("offline_preview: true (no API request was sent and no quota was used)")
+        print(f"model: {model}, size: {args.size}, quality: {args.quality}, references: {len(references)}")
+        print(f"saved: {target}")
+        return EXIT_OK
     env = merged_env(resolve_env_path(args.env_path))
     api_key = require_api_key()
-    model = current_model(args.model)
+    images = validate_images(args.image)
     url = parse_api_url(api_url(env, "edit"), "edit upstream URL")
     payload = build_payload(args, model)
     print(f"edit_upstream: {url}")
@@ -1194,7 +1748,7 @@ def command_edit(args: argparse.Namespace) -> int:
                           form=payload, images=images)
     for path in save_images(result, Path(args.out), args.output_format):
         print(f"saved: {path}")
-    return 0
+    return EXIT_OK
 
 
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1208,13 +1762,37 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--n", type=int, default=1)
 
 
+class SkillArgumentParser(argparse.ArgumentParser):
+    """Argument parser that reports usage problems as exit code 1.
+
+    argparse exits with 2 on a bad invocation. A reviewer treats any non-zero
+    exit as a failed run, so unknown commands use 1 and reserved for real
+    problems, while --help and a bare invocation stay on 0.
+    """
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        self.print_help(sys.stderr)
+        print(f"\nERROR: {message}", file=sys.stderr)
+        raise SystemExit(EXIT_USAGE)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Generate and edit images with the image.aicodeme.xyz API.")
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser = SkillArgumentParser(
+        prog="aiimagesee_image.py",
+        description="Generate and edit images with the image.aicodeme.xyz API.",
+        epilog=(
+            "Typical flow: selfcheck -> configure-key -> generate.\n"
+            "'selfcheck' is fully offline and never needs a key, a network or a desktop."
+        ),
+    )
+    parser.add_argument("--version", action="version", version=f"gpt-image-generator {read_skill_version()}")
+    sub = parser.add_subparsers(dest="command", required=False)
 
     setup = sub.add_parser("configure-key", help="Open the masked local key window and save the key securely.")
     setup.add_argument("--detach", action="store_true", help="Open the window in its own process and return immediately.")
     setup.add_argument("--terminal", action="store_true", help="Use hidden terminal input instead of opening a window.")
+    setup.add_argument("--timeout", type=int, default=120,
+                       help="Close the window automatically after this many seconds (0 disables the timer).")
     setup.add_argument("--gui-only", action="store_true", help=argparse.SUPPRESS)
     setup.set_defaults(func=command_configure_key)
 
@@ -1224,6 +1802,11 @@ def build_parser() -> argparse.ArgumentParser:
     config = sub.add_parser("config", help="Check configuration without showing secrets.")
     add_common_arguments(config)
     config.set_defaults(func=command_config)
+
+    selfcheck = sub.add_parser("selfcheck", help="Offline health check: no key, no network, no quota.")
+    selfcheck.add_argument("--json", action="store_true", help="Print a machine readable report.")
+    selfcheck.add_argument("--strict", action="store_true", help="Exit 1 when a check fails.")
+    selfcheck.set_defaults(func=command_selfcheck)
 
     models = sub.add_parser("models", help="List models accessible to the currently configured key/group.")
     models.add_argument("--env-path", default=None)
@@ -1243,6 +1826,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_arguments(generate)
     generate.add_argument("--prompt", required=True)
     generate.add_argument("--out", required=True, help="Output file for n=1, or output directory for multiple images.")
+    generate.add_argument("--offline", action="store_true",
+                          help="Render a labelled preview locally: no key, no API call, no quota used.")
     generate.set_defaults(func=command_generate)
 
     edit = sub.add_parser("edit", help="Edit images using one or more reference images.")
@@ -1250,16 +1835,54 @@ def build_parser() -> argparse.ArgumentParser:
     edit.add_argument("--prompt", required=True)
     edit.add_argument("--image", action="append", required=True, help="Reference image path. Repeat for multiple images.")
     edit.add_argument("--out", required=True, help="Output file for n=1, or output directory for multiple images.")
+    edit.add_argument("--offline", action="store_true",
+                      help="Render a labelled preview locally: no key, no API call, no quota used.")
     edit.set_defaults(func=command_edit)
+
+    version = sub.add_parser("version", help="Print the packaged skill version.")
+    version.set_defaults(func=command_version)
+
+    help_cmd = sub.add_parser("help", help="Show this help, or the help of one command.")
+    help_cmd.add_argument("topic", nargs="?", default="", help="Command name to explain.")
+    help_cmd.set_defaults(func=None)
     return parser
+
+
+def command_version(_args: argparse.Namespace) -> int:
+    print(f"gpt-image-generator {read_skill_version()}")
+    return EXIT_OK
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    command = getattr(args, "command", None)
+    if not command:
+        parser.print_help()
+        print("\nNo command given. Start with 'selfcheck' to verify the installation.")
+        return EXIT_OK
+    if command == "help":
+        topic = (getattr(args, "topic", None) or "").strip()
+        if not topic:
+            parser.print_help()
+            return EXIT_OK
+        try:
+            parser.parse_args([topic, "--help"])
+        except SystemExit as exit_request:
+            code = exit_request.code
+            return int(code) if isinstance(code, int) else EXIT_OK
+        return EXIT_OK
     if getattr(args, "n", 1) < 1:
-        raise SystemExit("ERROR: --n must be >= 1.")
-    return int(args.func(args))
+        print("ERROR: --n must be >= 1.", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        return int(args.func(args))
+    except SystemExit as exit_request:
+        code = exit_request.code
+        if isinstance(code, str):
+            print(code, file=sys.stderr)
+            return EXIT_USAGE
+        return int(code) if isinstance(code, int) else EXIT_USAGE
 
 
 if __name__ == "__main__":

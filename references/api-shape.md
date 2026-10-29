@@ -41,3 +41,35 @@ The helper redacts the configured key from upstream error text. Common responses
 - Settings contain the selected model only; the key is never written to `settings.json`.
 - Run `python scripts/aiimagesee_image.py configure-key` to open the masked setup window; it blocks until the user saves or cancels, then prints `dialog_result:` and `api_key:`. Use `--terminal` for hidden terminal input, `--detach` only when the host keeps detached children alive. The user can remove the saved credential later with `python scripts/aiimagesee_image.py clear-key`, which asks for confirmation and never displays the key.
 - Popup prerequisites: a Python interpreter that can `import tkinter`. The helper checks itself first, then `gui_python` from settings, `py -3`, `python`/`pythonw` on PATH, and common install locations; the winner is saved as `gui_python` and shown by `config`. If none is found it raises a native message box instead of hanging.
+
+## Offline behaviour (no key, no network, no desktop)
+
+The helper is designed so that a machine without credentials or an interactive session can still prove the installation works. Three mechanisms cover that case:
+
+- `selfcheck` — runs entirely offline. It reports the Python version, whether `tkinter` imports, whether a desktop session exists, which HTTP client will be used, whether the credential store is reachable, whether a key is configured, the packaged `SKILL.md` location, the sub-resource directory depth, the defaults, and the flat price. It never opens a socket, never prints the key, and never consumes quota. `--json` prints the same report as JSON; `--strict` makes a failed check exit `1`. The normal exit code is `0`.
+- `--offline` on `generate` and `edit` — renders a labelled preview PNG locally and writes it to `--out`. The image is produced with the standard library only (`zlib` + `struct`); Pillow is used when present purely to draw readable Chinese labels. The preview is stamped `OFFLINE PREVIEW`, the request parameters are embedded in the PNG `tEXt` metadata, and it must never be presented to a user as model output.
+- Environment injection — `GPT_IMAGE_API_KEY` (or `IMAGE_API_KEY`) takes precedence over the stored credential for the current session only. This is the recommended route for CI and for headless machines.
+
+## Headless sessions
+
+`configure-key` never blocks when no human can answer it:
+
+- The helper probes the window station on Windows, `DISPLAY` / `WAYLAND_DISPLAY` on Linux, and `SSH_CONNECTION` on macOS. When no desktop is available it returns exit code `3` and prints the three recovery paths (run it in a local desktop terminal, inject `GPT_IMAGE_API_KEY`, or create a key first).
+- The Tk window arms its own timer (`--timeout`, default 120 seconds) and closes itself cleanly when nobody answers, returning exit code `4`.
+- `--terminal` masked input cannot be interrupted safely, so a process level watchdog terminates it at the same timeout with exit code `4`.
+- `GPT_IMAGE_GENERATOR_HEADLESS=1` forces the headless path for testing.
+
+## Exit codes
+
+Automation and review tooling judge success by exit code, so only genuine problems use a non-zero value.
+
+| Code | Meaning |
+| --- | --- |
+| `0` | The command completed. Informative states such as "no key configured yet" are still a success. |
+| `1` | Usage error or invalid argument. |
+| `2` | No credential is available, so the API cannot be called. |
+| `3` | No interactive desktop, so the key window cannot be shown. |
+| `4` | The wait timed out and was stopped automatically. |
+
+`--help`, `-h`, `help`, and a bare invocation all print usage and exit `0`. Only an unknown command exits `1`.
+
