@@ -6,3 +6,6 @@ Thumbs.db
 
 # local only
 _user_meta.json
+
+# build output (regenerate with tools/pack_skill.py)
+dist/

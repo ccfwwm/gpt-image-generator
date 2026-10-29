@@ -116,8 +116,31 @@ gpt-image-generator/
 │   └── setup-0*.png|jpg          # 四步截图
 ├── scripts/
 │   └── aiimagesee_image.py       # 单文件 CLI
+├── tools/
+│   └── pack_skill.py             # 发布包构建与门禁脚本（仅仓库使用，不随包发布）
 └── docs/dialog.png               # 弹窗截图
 ```
+
+## 从源码构建发布包
+
+要提交到 WorkBuddy 开放平台的 zip 由脚本生成，带完整门禁，任何一项不过就不会产出包：
+
+```bash
+python tools/pack_skill.py            # 产出 dist/gpt-image-generator.zip
+python tools/pack_skill.py -o out.zip # 指定输出路径
+```
+
+门禁依次做这些事：
+
+1. 校验 `SKILL.md` frontmatter（必填字段、kebab-case 名称、无尖括号、semver 版本、字段白名单）
+2. 校验正文里的 `@references/...` 引用都真实存在
+3. 只暂存 `SKILL.md` + `references/` `scripts/` `templates/`，并检查目录层级 ≤ 2
+4. 用**暂存副本**跑一遍 `selfcheck`
+5. 打包时固定 mtime，产物**字节级可复现**
+6. 体积 ≤ 3 MB，且扫描包内是否有疑似凭证
+7. 把 zip 解到临时 HOME 里，跑 14 条命令的干净环境回归，并校验离线预览图真的产出了 PNG
+
+脚本不含任何机器相关的绝对路径，克隆仓库后即可复现同一个包。
 
 ## 安全说明
 
