@@ -5,9 +5,17 @@ display_name_en: GPT Image Generator
 description: Advanced AI image generation and editor built on GPT Image 2.5. Every model (gpt-image-2, gpt-image-2.5, gpt-image-2.5-sunburst, gpt-image-2.5-flare) costs a flat ¥0.04 per image, with switchable quality and size. Use it for text-to-image, image-to-image, photo editing, e-commerce product shots, ad creatives, product detail pages, social seeding visuals, and popup-based API key setup.
 description_zh: 基于 GPT Image 2.5 的进阶版 AI 图片生成与编辑器，全部模型（gpt-image-2、gpt-image-2.5、gpt-image-2.5-sunburst、gpt-image-2.5-flare）统一 ¥0.04/张，画质与尺寸可自由切换。当用户需要文生图、图生图、图片编辑、电商图、广告图、详情页、带货图、种草图，或用弹窗配置图像 API 密钥时使用此 Skill。
 description_en: An advanced AI image generation and editor built on GPT Image 2.5. Every model (gpt-image-2, gpt-image-2.5, gpt-image-2.5-sunburst, gpt-image-2.5-flare) costs a flat ¥0.04 per image, with switchable quality and size. Use it for text-to-image, image-to-image, photo editing, e-commerce product shots, ad creatives, product detail pages, social seeding visuals, and popup-based API key setup.
+examples_zh:
+  - "用 gpt-image-2.5 生成一张极简蓝绿色科技感海报背景，右侧留白给文案，保存到当前项目。"
+  - "把这张随手拍的商品图改成白底电商主图，突出材质与光影，出 3:2 横版。"
+  - "帮我配好图片 API 密钥：直接弹窗给我填，顺便把注册和建密钥的四步截图给我看。"
+examples_en:
+  - "Use gpt-image-2.5 to generate a minimalist blue-green tech poster background with empty space on the right for copy, and save it in the project."
+  - "Turn this casual product snapshot into a white-background e-commerce hero shot with visible texture and light, in 3:2 landscape."
+  - "Set up my image API key with the local popup and walk me through the four setup screenshots."
 category: 内容创作
 allowed-tools: Bash, Read
-version: 2.4.2
+version: 2.4.3
 author: 程迅科技
 ---
 
